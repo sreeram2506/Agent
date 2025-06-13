@@ -5,12 +5,14 @@ import logging
 import hashlib
 import unicodedata
 import numpy as np
+import torch
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageOps
 from typing import Optional, List, Tuple, Union
 from io import BytesIO
 from urllib.parse import urlparse
 import mimetypes
 from dataclasses import dataclass
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
 from config.settings import Settings
 
 @dataclass
@@ -33,7 +35,9 @@ class ImageGenerator:
         os.makedirs(self.assets_dir, exist_ok=True)
         os.makedirs(self.fonts_dir, exist_ok=True)
         self.logo_path = logo_path
-
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.ai_model = None  # Will be loaded on first use
+        
         # Modern color palettes
         self.palettes = {
             'tech': ['#0a192f', '#64ffda', '#00ddeb', '#ff6b6b'],  # Deep navy, cyan, red
@@ -41,43 +45,52 @@ class ImageGenerator:
             'general': ['#2d3436', '#a8e6ce', '#ff7675', '#d8a7b1']  # Dark gray, mint, coral
         }
 
+    def _load_ai_model(self):
+        """Load the Stable Diffusion model if not already loaded"""
+        if self.ai_model is None:
+            print("Loading Stable Diffusion model...")
+            model_id = "runwayml/stable-diffusion-v1-5"
+            self.ai_model = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                safety_checker=None
+            )
+            self.ai_model.scheduler = DPMSolverMultistepScheduler.from_config(self.ai_model.scheduler.config)
+            self.ai_model = self.ai_model.to(self.device)
+            if self.device == "cuda":
+                self.ai_model.enable_attention_slicing()
+            print("Model loaded successfully")
+
     def _generate_ai_image(self, prompt: str) -> Optional[Image.Image]:
-        """Generate an image using Stability AI API"""
+        """Generate an image using Stable Diffusion"""
         try:
-            from stability_sdk import client
-            import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
-
-            stability_api = client.StabilityInference(
-                key=os.getenv('STABILITY_KEY'),  # Get API key from environment
-                verbose=True,
-            )
-
-            answers = stability_api.generate(
-                prompt=prompt,
-                width=1024,
-                height=1024,
-                samples=1,
-            )
-
-            for resp in answers:
-                for artifact in resp.artifacts:
-                    if artifact.finish_reason == generation.FILTER:
-                        print("Content warning, try a different prompt")
-                        continue
-                    if artifact.type == generation.ARTIFACT_IMAGE:
-                        return Image.open(io.BytesIO(artifact.binary))
-                        
+            self._load_ai_model()
+            
+            # Enhance the prompt for better results
+            enhanced_prompt = f"{prompt}, high quality, detailed, professional photography, 8k, ultra detailed"
+            
+            with torch.inference_mode():
+                image = self.ai_model(
+                    enhanced_prompt,
+                    width=1024,
+                    height=1024,
+                    num_inference_steps=25,
+                    guidance_scale=7.5,
+                    negative_prompt="low quality, blurry, distorted, text, watermark, signature"
+                ).images[0]
+                
+            return image.convert('RGB')
+            
         except Exception as e:
-            print(f"Error generating image via API: {e}")
+            logging.error(f"Error generating AI image: {e}")
             import traceback
             traceback.print_exc()
-        
-        return None
+            return None
 
     def _download_image(self, url: str, prompt: str = None) -> Optional[Image.Image]:
         """Download an image from URL or generate one using AI if URL is not provided."""
         if not url and prompt:
-            print("Generating AI image...")
+            print("No image URL provided, generating AI image...")
             return self._generate_ai_image(prompt)
             
         if not url:
@@ -94,8 +107,8 @@ class ImageGenerator:
             if 'image' not in content_type:
                 parsed = urlparse(url)
                 if not mimetypes.guess_type(parsed.path)[0] or 'image' not in mimetypes.guess_type(parsed.path)[0]:
-                    logging.warning(f"URL does not point to an image: {url}")
-                    return None
+                    logging.warning(f"URL does not point to an image, generating AI image instead: {url}")
+                    return self._generate_ai_image(prompt or "A beautiful landscape")
             
             image = Image.open(BytesIO(response.content))
             
@@ -109,11 +122,12 @@ class ImageGenerator:
             return image
             
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error downloading image from {url}: {e}")
-        except Exception as e:
-            logging.error(f"Error processing image from {url}: {e}")
+            logging.error(f"Error downloading image from {url}, falling back to AI generation: {e}")
+            return self._generate_ai_image(prompt or "A beautiful landscape")
             
-        return None
+        except Exception as e:
+            logging.error(f"Error processing image from {url}, falling back to AI generation: {e}")
+            return self._generate_ai_image(prompt or "A beautiful landscape")
 
     def _get_font(self, size: int, bold: bool = False, italic: bool = False) -> ImageFont.FreeTypeFont:
         """Get a font with the specified size and style."""
@@ -138,7 +152,7 @@ class ImageGenerator:
                              shadow: bool = True, anchor: str = None,
                              gradient: Optional[Tuple[str, str]] = None) -> None:
         """Draw text with optional effects like shadow, stroke, and gradient."""
-        text = unicodedata.normalize('NFKD', str(text)).encode('latin-1', 'ignore').decode('latin-1')
+        text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
         x, y = position
         
         # Create a temporary image for text with effects
@@ -201,7 +215,20 @@ class ImageGenerator:
             line = []
             while words:
                 test_line = ' '.join(line + [words[0]])
-                if font.getlength(test_line) <= max_width:
+                # Use font.getbbox() for modern Pillow versions (9.0.0+)
+                try:
+                    # First try the modern approach with getbbox
+                    bbox = font.getbbox(test_line)
+                    text_width = bbox[2] - bbox[0]  # right - left
+                except AttributeError:
+                    # Fall back to getsize if getbbox doesn't exist
+                    try:
+                        text_width = font.getsize(test_line)[0]
+                    except AttributeError:
+                        # If both methods fail, raise a more descriptive error
+                        raise RuntimeError("Your Pillow version doesn't support any known text measurement methods. Please upgrade Pillow to the latest version.")
+                
+                if text_width <= max_width:
                     line.append(words.pop(0))
                 else:
                     break
@@ -242,8 +269,8 @@ class ImageGenerator:
             logging.error(f"Error adding watermark: {e}")
             return image
 
-    def create_news_thumbnail(self, article: dict, image_path: Optional[str] = None) -> Optional[Image.Image]:
-        """Create a news thumbnail with the given settings."""
+    def create_news_thumbnail(self, article: dict, image_path: Optional[str] = None) -> Optional[str]:
+        """Create a news thumbnail with the given settings and return the file path."""
         print(f"Creating thumbnail for {article}")
         try:
             # Create base image with background color
@@ -285,68 +312,47 @@ class ImageGenerator:
                 draw = ImageDraw.Draw(image)
             
             # Add title
-            title_font = self._get_font(72, bold=True)
+            title_font = self._get_font(48, bold=True)
             title = self._wrap_text(article['title'], title_font, self.image_size[0] - 100)
-            title_bbox = draw.textbbox((0, 0), title, font=title_font)
-            title_height = title_bbox[3] - title_bbox[1]
             
-            # Add subtitle if exists
-            subtitle_y = self.image_size[1] - 100
-            if article.get('subtitle'):
-                subtitle_font = self._get_font(36)
-                subtitle = self._wrap_text(article['subtitle'], subtitle_font, self.image_size[0] - 200)
-                subtitle_bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
-                subtitle_height = subtitle_bbox[3] - subtitle_bbox[1]
-                subtitle_y = self.image_size[1] - 100 - subtitle_height - 20
-                
-                # Draw subtitle with effects
-                self._add_text_with_effects(
-                    draw, subtitle, 
-                    (self.image_size[0] // 2, subtitle_y),
-                    subtitle_font, 
-                    fill=primary_color,
-                    stroke=(2, bg_color),
-                    anchor='mm'
-                )
+            # Calculate text position
+            _, _, _, text_height = draw.textbbox((0, 0), title, font=title_font)
+            text_y = self.image_size[1] - 300 - text_height
             
-            # Draw title with effects
+            # Add text with effects
             self._add_text_with_effects(
                 draw, title,
-                (self.image_size[0] // 2, subtitle_y - 30),
+                (self.image_size[0] // 2, text_y),
                 title_font,
-                fill='#ffffff',
-                stroke=(3, bg_color),
+                fill=primary_color,
+                stroke=(2, bg_color),
                 anchor='mm'
             )
             
-            # Add category tag
-            category_font = self._get_font(24, bold=True)
-            category_text = article['category'].upper()
-            category_bbox = draw.textbbox((0, 0), category_text, font=category_font)
-            category_width = category_bbox[2] - category_bbox[0] + 30
-            category_height = category_bbox[3] - category_bbox[1] + 10
-            
-            # Draw category background
-            draw.rounded_rectangle(
-                [(40, 40), (40 + category_width, 40 + category_height)],
-                radius=15,
-                fill=accent_color
-            )
-            
-            # Draw category text
+            # Add source and date
+            source_font = self._get_font(24)
+            source_text = f"via {article['source']} • {article['published_at'][:10]}"
             self._add_text_with_effects(
-                draw, category_text,
-                (40 + category_width//2, 40 + category_height//2),
-                category_font,
+                draw, source_text,
+                (self.image_size[0] // 2, self.image_size[1] - 50),
+                source_font,
                 fill='#ffffff',
                 anchor='mm'
             )
             
-            # Add watermark if logo path is provided
-            # if self.logo_path:
-            #     image = self._add_watermark(image, self.logo_path)
+            # Save the image
+            if not image_path:
+                # Create assets directory if it doesn't exist
+                assets_dir = os.path.join(os.path.dirname(__file__), '..', 'assets')
+                os.makedirs(assets_dir, exist_ok=True)
+                image_path = os.path.join(assets_dir, 'news_thumbnail.jpg')
+            else:
+                # Ensure the directory of the provided path exists
+                os.makedirs(os.path.dirname(os.path.abspath(image_path)), exist_ok=True)
             
-            return image
+            image.save(image_path, 'JPEG', quality=90)
+            print(f"Created image at {image_path}")
+            return image_path
             
         except Exception as e:
             logging.error(f"Error creating thumbnail: {e}")
