@@ -49,39 +49,53 @@ class ImageGenerator:
             'general': ['#2d3436', '#a8e6ce', '#ff7675', '#d8a7b1']  # Dark gray, mint, coral
         }
 
-    def _load_ai_model(self):
-        """Load the AI model if not already loaded"""
+    def _load_ai_model(self, model_id: str = "kandinsky-community/kandinsky-2-2-decoder"):
+        """Load a selected AI model dynamically with fallback support"""
         if self.pipe is None:
-            print("Loading Kandinsky 2.2 model...")
+            print(f"Loading model: {model_id}")
             try:
-                self.pipe = AutoPipelineForText2Image.from_pretrained(
-                    "kandinsky-community/kandinsky-2-2-decoder",
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    use_safetensors=True
-                )
-                
+                if model_id == "kandinsky-community/kandinsky-2-2-decoder":
+                    from diffusers import AutoPipelineForText2Image
+                    self.pipe = AutoPipelineForText2Image.from_pretrained(
+                        model_id,
+                        torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                        use_safetensors=True
+                    )
+                else:
+                    from diffusers import StableDiffusionPipeline
+                    self.pipe = StableDiffusionPipeline.from_pretrained(
+                        model_id,
+                        torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                        use_safetensors=True,
+                        safety_checker=None  # Optional, disable if needed
+                    )
+
                 if self.device == "cuda":
                     self.pipe = self.pipe.to("cuda")
-                    self.pipe.enable_model_cpu_offload()
-                    self.pipe.enable_xformers_memory_efficient_attention()
-                    
-                print("Model loaded successfully")
-                
+                    if hasattr(self.pipe, "enable_model_cpu_offload"):
+                        self.pipe.enable_model_cpu_offload()
+                    if hasattr(self.pipe, "enable_xformers_memory_efficient_attention"):
+                        self.pipe.enable_xformers_memory_efficient_attention()
+
+                print(f"Model '{model_id}' loaded successfully")
+
             except Exception as e:
-                logging.error(f"Failed to load Kandinsky model: {e}")
-                # Fallback to a simpler model if the main one fails
+                logging.error(f"Failed to load model '{model_id}': {e}")
+                print("⚠️ Falling back to Stable Diffusion v1.5")
                 try:
                     self.pipe = StableDiffusionPipeline.from_pretrained(
                         "runwayml/stable-diffusion-v1-5",
                         torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                        use_safetensors=True,
                         safety_checker=None
                     )
                     if self.device == "cuda":
                         self.pipe = self.pipe.to("cuda")
-                    print("Falling back to Stable Diffusion 1.5")
+                    print("Fallback model loaded: runwayml/stable-diffusion-v1-5")
                 except Exception as e2:
                     logging.error(f"Failed to load fallback model: {e2}")
                     raise
+
 
     def _generate_ai_image(self, prompt: str, article: dict = None) -> Optional[Image.Image]:
         """Generate an image using AI with enhanced prompt engineering"""
@@ -157,7 +171,7 @@ class ImageGenerator:
 
     def _download_image(self, url: str, prompt: str = None) -> Optional[Image.Image]:
         """Download an image from URL or generate one using AI if URL is not provided."""
-        if not url and prompt:
+        if url and prompt:
             print("No image URL provided, generating AI image...")
             return self._generate_ai_image(prompt)
             
@@ -427,3 +441,5 @@ class ImageGenerator:
             import traceback
             traceback.print_exc()
             return None
+
+

@@ -14,3 +14,4 @@ safetensors
 huggingface-hub
 xformers
 torchvision
+ipdb
