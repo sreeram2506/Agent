@@ -13,6 +13,9 @@ class Settings:
     # News API
     NEWS_API_KEY = os.getenv("NEWS_API_KEY")
     NEWS_SOURCES = "techcrunch,engadget,wired,bbc-news,cnn"
+
+    # Hugging Face
+    HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
     
     # OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

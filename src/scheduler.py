@@ -36,7 +36,7 @@ class NewsToInstagramScheduler:
         try:
             # Fetch latest news
             articles = self.news_fetcher.fetch_top_news(count=5)  # Get 5, we'll pick the first new one
-            
+            print('sreeram', articles)
             if not articles:
                 print("No articles found to post.")
                 return
@@ -59,7 +59,7 @@ class NewsToInstagramScheduler:
             # Generate content
             article_to_post['category'] = 'general'
             caption = self.content_processor.generate_instagram_caption(article_to_post)
-            print("Generated caption.", article_to_post)
+            print("Generated caption.", caption)
             
             # Create image
             image_path = self.image_generator.create_news_thumbnail(article_to_post, image_path)

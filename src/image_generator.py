@@ -12,7 +12,11 @@ from io import BytesIO
 from urllib.parse import urlparse
 import mimetypes
 from dataclasses import dataclass
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import AutoPipelineForText2Image, StableDiffusionPipeline
+import torch
+from typing import Optional
+from PIL import Image
+import logging
 from config.settings import Settings
 
 @dataclass
@@ -36,7 +40,7 @@ class ImageGenerator:
         os.makedirs(self.fonts_dir, exist_ok=True)
         self.logo_path = logo_path
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.ai_model = None  # Will be loaded on first use
+        self.pipe = None  # Will be loaded on first use
         
         # Modern color palettes
         self.palettes = {
@@ -46,40 +50,104 @@ class ImageGenerator:
         }
 
     def _load_ai_model(self):
-        """Load the Stable Diffusion model if not already loaded"""
-        if self.ai_model is None:
-            print("Loading Stable Diffusion model...")
-            model_id = "runwayml/stable-diffusion-v1-5"
-            self.ai_model = StableDiffusionPipeline.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                safety_checker=None
-            )
-            self.ai_model.scheduler = DPMSolverMultistepScheduler.from_config(self.ai_model.scheduler.config)
-            self.ai_model = self.ai_model.to(self.device)
-            if self.device == "cuda":
-                self.ai_model.enable_attention_slicing()
-            print("Model loaded successfully")
+        """Load the AI model if not already loaded"""
+        if self.pipe is None:
+            print("Loading Kandinsky 2.2 model...")
+            try:
+                self.pipe = AutoPipelineForText2Image.from_pretrained(
+                    "kandinsky-community/kandinsky-2-2-decoder",
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                    use_safetensors=True
+                )
+                
+                if self.device == "cuda":
+                    self.pipe = self.pipe.to("cuda")
+                    self.pipe.enable_model_cpu_offload()
+                    self.pipe.enable_xformers_memory_efficient_attention()
+                    
+                print("Model loaded successfully")
+                
+            except Exception as e:
+                logging.error(f"Failed to load Kandinsky model: {e}")
+                # Fallback to a simpler model if the main one fails
+                try:
+                    self.pipe = StableDiffusionPipeline.from_pretrained(
+                        "runwayml/stable-diffusion-v1-5",
+                        torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                        safety_checker=None
+                    )
+                    if self.device == "cuda":
+                        self.pipe = self.pipe.to("cuda")
+                    print("Falling back to Stable Diffusion 1.5")
+                except Exception as e2:
+                    logging.error(f"Failed to load fallback model: {e2}")
+                    raise
 
-    def _generate_ai_image(self, prompt: str) -> Optional[Image.Image]:
-        """Generate an image using Stable Diffusion"""
+    def _generate_ai_image(self, prompt: str, article: dict = None) -> Optional[Image.Image]:
+        """Generate an image using AI with enhanced prompt engineering"""
         try:
             self._load_ai_model()
             
-            # Enhance the prompt for better results
-            enhanced_prompt = f"{prompt}, high quality, detailed, professional photography, 8k, ultra detailed"
+            if not prompt and article:
+                prompt = article.get('title', 'News illustration')
+            
+            # Create a more detailed prompt based on article content
+            if article:
+                enhanced_prompt = (
+                    f"Professional news illustration of {article.get('title', '')}. "
+                    f"{article.get('description', '')} "
+                    "High quality, detailed, professional digital art, trending on artstation, 8k, "
+                    "sharp focus, cinematic lighting, highly detailed, intricate"
+                )
+            else:
+                enhanced_prompt = (
+                    f"{prompt}, professional illustration, high quality, detailed, "
+                    "trending on artstation, 8k, vibrant colors, sharp focus, "
+                    "cinematic lighting, highly detailed, intricate"
+                )
+            
+            # Common negative prompt
+            negative_prompt = (
+                "low quality, blurry, distorted, text, watermark, signature, "
+                "ugly, disfigured, low resolution, bad anatomy, extra limbs, "
+                "poorly drawn face, mutation, deformed, blurry, bad proportions, "
+                "extra fingers, duplicate, cropped, jpeg artifacts, out of frame"
+            )
+            
+            print(f"Generating AI image with prompt: {enhanced_prompt}")
             
             with torch.inference_mode():
-                image = self.ai_model(
-                    enhanced_prompt,
-                    width=1024,
-                    height=1024,
-                    num_inference_steps=25,
-                    guidance_scale=7.5,
-                    negative_prompt="low quality, blurry, distorted, text, watermark, signature"
-                ).images[0]
+                # Try to generate with higher quality settings
+                try:
+                    # First try with Kandinsky 2.2
+                    image = self.pipe(
+                        prompt=enhanced_prompt,
+                        negative_prompt=negative_prompt,
+                        width=1024,
+                        height=1024,
+                        num_inference_steps=50,
+                        guidance_scale=8.0,
+                        num_images_per_prompt=1,
+                    ).images[0]
+                except Exception as e:
+                    print(f"Error with Kandinsky, falling back to simpler settings: {e}")
+                    # Fallback to simpler settings
+                    image = self.pipe(
+                        prompt=enhanced_prompt,
+                        negative_prompt=negative_prompt,
+                        width=768,
+                        height=768,
+                        num_inference_steps=30,
+                        guidance_scale=7.5
+                    ).images[0]
                 
-            return image.convert('RGB')
+                # Apply some post-processing
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.1)
+                enhancer = ImageEnhance.Sharpness(image)
+                image = enhancer.enhance(1.2)
+                
+                return image.convert('RGB')
             
         except Exception as e:
             logging.error(f"Error generating AI image: {e}")
